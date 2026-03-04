@@ -1,0 +1,262 @@
+#
+# Original project: Kleoris - A modern Javascript/react runtime for desktop app.
+# by Laurent Mihalkovic
+#
+# -------------------------------------------------------------------------
+# Copyright (c) 2025-present, Laurent Mihalkovic. All rights reserved.
+
+name: Build Skia
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Target platform to build (or "all" to build every matrix entry)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - macos-skia
+          - linux-skia
+          - win-skia
+      skia_ref:
+        description: 'Branch/tag/commit to build (google/skia)'
+        required: false
+        default: 'chrome/m146'
+      release_tag:
+        description: 'Git tag to create a GitHub release (e.g. v0.1.0-skia-m146). Leave blank to skip release creation.'
+        required: false
+        default: ''
+
+jobs:
+  # ── Prepare: create dynamic matrix for target platforms ────────────────
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+    steps:
+      - name: Resolve target matrix
+        id: resolve
+        run: |
+          ALL='[
+            {"name":"macos-skia", "os":"macos-latest"},
+            {"name":"linux-skia", "os":"ubuntu-latest"},
+            {"name":"win-skia",   "os":"windows-latest"}
+          ]'
+          PLATFORM="${{ inputs.platform }}"
+          if [[ "$PLATFORM" == "all" || -z "$PLATFORM" ]]; then
+            MATRIX="$ALL"
+          else
+            MATRIX=$(echo "$ALL" | jq --arg p "$PLATFORM" '[.[] | select(.name == $p)]')
+          fi
+          echo "matrix=$(echo "$MATRIX" | jq -c .)" >> "$GITHUB_OUTPUT"
+
+  # ── Main build job ─────────────────────────────────────────────────────
+  main:
+    needs: prepare
+    runs-on: ${{ matrix.runtime.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+
+    steps:
+      # ── Checkout Skia ──────────────────────────────────────────────────
+      - name: Checkout Skia source
+        uses: actions/checkout@v4
+        with:
+          repository: google/skia
+          ref: ${{ inputs.skia_ref || 'main' }}
+          path: skia-src
+
+      # ── depot_tools (provides gn + python helpers) ─────────────────────
+      - name: Checkout depot_tools
+        uses: actions/checkout@v4
+        with:
+          repository: chromium/depot_tools
+          path: depot_tools
+
+      - name: Add depot_tools to PATH
+        shell: bash
+        run: echo "${{ github.workspace }}/depot_tools" >> "$GITHUB_PATH"
+
+      # ── Sync Skia third-party deps (lightweight, no gclient) ───────────
+      - name: Sync Skia dependencies
+        shell: bash
+        run: |
+          cd skia-src
+          python3 tools/git-sync-deps
+
+      # ── Platform dependencies ──────────────────────────────────────────
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            ninja-build \
+            libgl1-mesa-dev \
+            libglu1-mesa-dev \
+            libfontconfig-dev \
+            libx11-dev \
+            libxrandr-dev
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ninja --no-progress -y
+
+      # ── Define install prefix per platform ────────────────────────────
+      - name: Set install prefix
+        id: prefix
+        shell: bash
+        run: |
+          if   [[ "$RUNNER_OS" == "macOS"   ]]; then echo "value=/opt/homebrew/skia" >> "$GITHUB_OUTPUT"
+          elif [[ "$RUNNER_OS" == "Linux"   ]]; then echo "value=/usr/local/skia"    >> "$GITHUB_OUTPUT"
+          else                                       echo "value=C:/Dev/skia"        >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── GN args per platform ───────────────────────────────────────────
+      - name: Set GN args
+        id: gnargs
+        shell: bash
+        run: |
+          ARGS=(
+            is_official_build=true            
+            # font engines (bundled, not system)
+            skia_use_harfbuzz=true               skia_use_system_harfbuzz=false
+            skia_use_freetype=true               skia_use_system_freetype2=false
+            # image codecs (bundled, not system)
+            skia_use_libjpeg_turbo_decode=true   skia_use_libjpeg_turbo_encode=true    skia_use_system_libjpeg_turbo=false
+            skia_use_libpng_decode=true          skia_use_libpng_encode=true           skia_use_system_libpng=false
+            # disabled codecs
+            skia_use_libwebp_decode=false        skia_use_libwebp_encode=false
+            # disabled features
+            skia_enable_pdf=false
+            skia_use_gl=false
+            skia_enable_skshaper_tests=false
+            skia_enable_skottie=false
+          )
+          BASE="${ARGS[*]}"
+          if   [[ "$RUNNER_OS" == "macOS"   ]]; then echo "value=$BASE skia_use_metal=true  skia_use_vulkan=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$RUNNER_OS" == "Linux"   ]]; then echo "value=$BASE skia_use_metal=false skia_use_vulkan=true"  >> "$GITHUB_OUTPUT"
+          else                                       echo "value=$BASE skia_use_metal=false skia_use_vulkan=true"  >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Configure (gn gen) ─────────────────────────────────────────────
+      - name: Configure Skia (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: |
+          cd skia-src
+          bin/gn gen out/Release --args="${{ steps.gnargs.outputs.value }}"
+
+      - name: Configure Skia (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          cd skia-src
+          bin\gn gen out\Release --args="${{ steps.gnargs.outputs.value }}"
+
+      # ── Build ──────────────────────────────────────────────────────────
+      - name: Build Skia (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: |
+          cd skia-src
+          JOBS=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+          ninja -C out/Release skia -j"${JOBS}" 2>&1 | tee ../build.log
+
+      - name: Build Skia (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          cd skia-src
+          ninja -C out\Release skia
+
+      # ── Smoke test ─────────────────────────────────────────────────────
+      - name: Smoke-test build output (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: |
+          LIB="skia-src/out/Release/libskia.a"
+          test -f "$LIB" && echo "✓ libskia.a present ($(du -sh "$LIB" | cut -f1))" || (echo "✗ libskia.a not found"; exit 1)
+
+      - name: Smoke-test build output (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          LIB="skia-src/out/Release/skia.lib"
+          test -f "$LIB" && echo "✓ skia.lib present ($(du -sh "$LIB" | cut -f1))" || (echo "✗ skia.lib not found"; exit 1)
+
+      # ── Assemble install tree ──────────────────────────────────────────
+      # Layout: skia/lib/{libskia.a|skia.lib}  skia/include/**
+      - name: Assemble install tree (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: |
+          DIST="skia-dist"
+          mkdir -p "${DIST}/lib" "${DIST}/include"
+          cp skia-src/out/Release/libskia.a "${DIST}/lib/"
+          # Public headers — mirror the skia-src/include layout
+          cp -r skia-src/include/. "${DIST}/include/"
+          # modules headers (skparagraph, etc.)
+          for mod in skparagraph skshaper skunicode; do
+            src="skia-src/modules/${mod}/include"
+            [ -d "$src" ] && cp -r "$src/." "${DIST}/include/${mod}/"
+          done
+
+      - name: Assemble install tree (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          DIST="skia-dist"
+          mkdir -p "${DIST}/lib" "${DIST}/include"
+          cp skia-src/out/Release/skia.lib "${DIST}/lib/"
+          cp -r skia-src/include/. "${DIST}/include/"
+          for mod in skparagraph skshaper skunicode; do
+            src="skia-src/modules/${mod}/include"
+            [ -d "$src" ] && cp -r "$src/." "${DIST}/include/${mod}/"
+          done
+
+      # ── Package & upload ───────────────────────────────────────────────
+      - name: Package Skia
+        shell: bash
+        run: |
+          tar -cJf skia-${{ matrix.runtime.name }}.tar.xz -C skia-dist .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: skia-${{ matrix.runtime.name }}
+          path: skia-${{ matrix.runtime.name }}.tar.xz
+          retention-days: 30
+
+  # ── Release: collect all platform artifacts and publish a release ──────
+  release:
+    if: ${{ inputs.release_tag != '' }}
+    needs: main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: Skia — ${{ inputs.release_tag }}
+          draft: false
+          prerelease: true
+          body: |
+            Skia built from [google/skia](https://github.com/google/skia) @ `${{ inputs.skia_ref }}`.
+
+            GPU backends:
+            - macOS  → Metal
+            - Linux  → Vulkan
+            - Windows → Vulkan
+
+            Each tarball unpacks to `lib/` (static library) + `include/` (public headers).
+          files: dist/*.tar.xz
