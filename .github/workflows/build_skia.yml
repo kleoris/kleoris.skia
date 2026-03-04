@@ -66,6 +66,22 @@ jobs:
         runtime: ${{ fromJSON(needs.prepare.outputs.matrix) }}
 
     steps:
+      - name: Install Depot Tools
+        uses: newkdev/setup-depot-tools@v1.0.1
+
+      # - name: Get depot_tools
+      #   shell: bash
+      #   run: |
+      #     if [ ! -d "depot_tools" ]; then
+      #       git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+      #     fi
+      #     echo "${{ github.workspace }}/depot_tools" >> "$GITHUB_PATH"
+      #     export PATH="${PWD}/depot_tools:${PATH}"
+
+      # - name: Add depot_tools to PATH
+      #   shell: bash
+      #   run: echo "${{ github.workspace }}/depot_tools" >> "$GITHUB_PATH"
+
       # ── Checkout Skia ──────────────────────────────────────────────────
       - name: Checkout Skia source
         uses: actions/checkout@v4
@@ -73,17 +89,6 @@ jobs:
           repository: google/skia
           ref: ${{ inputs.skia_ref || 'main' }}
           path: skia-src
-
-      # ── depot_tools (provides gn + python helpers) ─────────────────────
-      - name: Checkout depot_tools
-        uses: actions/checkout@v4
-        with:
-          repository: chromium/depot_tools
-          path: depot_tools
-
-      - name: Add depot_tools to PATH
-        shell: bash
-        run: echo "${{ github.workspace }}/depot_tools" >> "$GITHUB_PATH"
 
       # ── Sync Skia third-party deps (lightweight, no gclient) ───────────
       - name: Sync Skia dependencies
